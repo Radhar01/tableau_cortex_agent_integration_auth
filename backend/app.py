@@ -12,7 +12,7 @@ from typing import Optional
 import requests
 import snowflake.connector
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -44,6 +44,12 @@ SESSION_IDLE_MINUTES = int(os.getenv("SESSION_IDLE_MINUTES", "60"))
 # Trial accounts cannot call Cortex Agents; this mode calls Cortex Analyst
 # with the semantic view directly and runs the generated SQL instead.
 USE_CORTEX_ANALYST = os.getenv("USE_CORTEX_ANALYST", "false").lower() == "true"
+# Saved chat history: 0 turns it off (the chat then behaves exactly as before).
+# The table is created by backend/chat_history_setup.sql. Rows are kept per Snowflake
+# user and read and written with that user's own session.
+CHAT_HISTORY_DAYS = int(os.getenv("CHAT_HISTORY_DAYS", "0"))
+CHAT_HISTORY_TABLE = os.getenv("CHAT_HISTORY_TABLE", "PHARMA_DEMO.CHAT_APP.USER_CHAT_HISTORY")
+CHAT_HISTORY_MAX_ROWS = 200
 
 
 def _load_agent_profiles() -> dict:
@@ -262,6 +268,11 @@ class ChatRequest(BaseModel):
     question: str
     conversation_history: Optional[list] = None
     agent: Optional[str] = None
+    # Optional, for saved history: the question as the user typed it (question may carry
+    # appended dashboard context), plus where it was asked. The user is the signed-in one.
+    display_question: Optional[str] = None
+    conversation_id: Optional[str] = None
+    dashboard: Optional[str] = None
 
 
 class LoginRequest(BaseModel):
@@ -330,8 +341,95 @@ def me(authorization: Optional[str] = Header(None)):
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-def chat(req: ChatRequest, authorization: Optional[str] = Header(None)):
+def chat(req: ChatRequest, background_tasks: BackgroundTasks, authorization: Optional[str] = Header(None)):
     sess = _session(authorization)
+    result = _answer(req, sess)
+    if CHAT_HISTORY_DAYS > 0 and req.conversation_id:
+        # Runs after the response is sent; a failure is logged and never reaches the user.
+        background_tasks.add_task(_save_history, req, result, sess)
+    return result
+
+
+def _save_history(req: ChatRequest, result: ChatResponse, sess: dict):
+    # USER_ID comes from the user's own Snowflake session, never from the browser.
+    try:
+        cur = sess["conn"].cursor()
+        try:
+            cur.execute(
+                f"INSERT INTO {CHAT_HISTORY_TABLE} (USER_ID, CONVERSATION_ID, AGENT_ID, DASHBOARD, QUESTION,"
+                " ANSWER, SQL_TEXT, RESULT_DATA, CHART_SPEC)"
+                " SELECT CURRENT_USER(), %s, %s, %s, %s, %s, %s, PARSE_JSON(%s), PARSE_JSON(%s)",
+                (
+                    req.conversation_id, _profile(req.agent)["id"], req.dashboard,
+                    req.display_question or req.question, result.answer, result.sql,
+                    json.dumps(result.data[:CHAT_HISTORY_MAX_ROWS], default=str) if result.data else None,
+                    result.chart_spec,
+                ),
+            )
+        finally:
+            cur.close()
+    except Exception as e:
+        logger.error(f"Saving chat history for {sess['user']} failed: {e}")
+
+
+def _parse_variant(value):
+    return json.loads(value) if isinstance(value, str) else value
+
+
+def _query_history(authorization: Optional[str], agent: Optional[str], sql: str, params: tuple) -> list:
+    if CHAT_HISTORY_DAYS <= 0:
+        raise HTTPException(status_code=404, detail="Chat history is disabled (CHAT_HISTORY_DAYS=0)")
+    sess = _session(authorization)
+    _use_profile(sess, _profile(agent))
+    cur = sess["conn"].cursor(snowflake.connector.DictCursor)
+    try:
+        return cur.execute(sql, params).fetchall()
+    except snowflake.connector.errors.Error as e:
+        logger.error(f"Reading chat history for {sess['user']} failed: {e}")
+        raise HTTPException(status_code=502, detail="Chat history is unavailable.")
+    finally:
+        cur.close()
+
+
+@app.get("/api/history/conversations")
+def history_conversations(agent: Optional[str] = None, authorization: Optional[str] = Header(None)):
+    """The signed-in user's conversations with this agent from the last CHAT_HISTORY_DAYS days, newest first."""
+    rows = _query_history(authorization, agent, (
+        "SELECT CONVERSATION_ID, MIN_BY(QUESTION, CREATED_AT) AS TITLE, MIN(CREATED_AT) AS STARTED_AT,"
+        " MAX(CREATED_AT) AS LAST_AT, COUNT(*) AS QUESTIONS"
+        f" FROM {CHAT_HISTORY_TABLE}"
+        " WHERE USER_ID = CURRENT_USER() AND AGENT_ID = %s AND CREATED_AT >= DATEADD(day, -%s, CURRENT_TIMESTAMP())"
+        " GROUP BY CONVERSATION_ID ORDER BY LAST_AT DESC LIMIT 50"
+    ), (_profile(agent)["id"], CHAT_HISTORY_DAYS))
+    return {"conversations": [{
+        "conversation_id": r["CONVERSATION_ID"],
+        "title": r["TITLE"],
+        "started_at": _json_safe(r["STARTED_AT"]),
+        "last_at": _json_safe(r["LAST_AT"]),
+        "questions": r["QUESTIONS"],
+    } for r in rows]}
+
+
+@app.get("/api/history/messages")
+def history_messages(conversation_id: str, agent: Optional[str] = None, authorization: Optional[str] = Header(None)):
+    rows = _query_history(authorization, agent, (
+        "SELECT QUESTION, ANSWER, SQL_TEXT, RESULT_DATA, CHART_SPEC, CREATED_AT"
+        f" FROM {CHAT_HISTORY_TABLE}"
+        " WHERE USER_ID = CURRENT_USER() AND CONVERSATION_ID = %s AND CREATED_AT >= DATEADD(day, -%s, CURRENT_TIMESTAMP())"
+        " ORDER BY CREATED_AT"
+    ), (conversation_id, CHAT_HISTORY_DAYS))
+    return {"messages": [{
+        "question": r["QUESTION"],
+        "answer": r["ANSWER"],
+        "sql": r["SQL_TEXT"],
+        "data": _parse_variant(r["RESULT_DATA"]),
+        "chart_spec": r["CHART_SPEC"] if isinstance(r["CHART_SPEC"], str) or r["CHART_SPEC"] is None
+        else json.dumps(r["CHART_SPEC"]),
+        "created_at": _json_safe(r["CREATED_AT"]),
+    } for r in rows]}
+
+
+def _answer(req: ChatRequest, sess: dict) -> ChatResponse:
     messages = []
     if req.conversation_history:
         messages.extend(req.conversation_history)
@@ -437,6 +535,7 @@ def health():
 def agents():
     return {
         "default": DEFAULT_AGENT,
+        "history_days": CHAT_HISTORY_DAYS,
         "agents": [{"id": p["id"], "label": p["label"], "suggestions": p["suggestions"]} for p in AGENT_PROFILES.values()],
     }
 

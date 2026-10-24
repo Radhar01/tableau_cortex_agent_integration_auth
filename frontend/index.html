@@ -72,6 +72,11 @@ body{font-family:'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;background:
 .suggestions button{padding:7px 14px;background:#e8eef6;color:#002855;border:1px solid #c4d2e4;border-radius:18px;font-size:12px;font-weight:500;cursor:pointer;transition:all .2s}
 .suggestions button:hover{background:#002855;color:#fff;border-color:#002855}
 
+.history-bar{display:none;align-items:center;gap:8px;padding:8px 20px;background:#fff;border-bottom:1px solid #e4e8ec;font-size:12px;color:#5a6a7a}
+.history-bar select{flex:1;min-width:0;padding:5px 8px;border:1px solid #c8d0da;border-radius:6px;font-size:12px;color:#2c3e50;background:#fff;cursor:pointer}
+.history-bar button{padding:5px 12px;background:#e8eef6;color:#002855;border:1px solid #c4d2e4;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap}
+.history-bar button:hover{background:#002855;color:#fff;border-color:#002855}
+
 .context-bar{display:none;align-items:center;gap:8px;padding:8px 20px;background:#fff8e6;border-bottom:1px solid #f1dfb0;font-size:12px;color:#6b4e00}
 .context-bar label{display:flex;align-items:center;gap:6px;cursor:pointer;white-space:nowrap;font-weight:600}
 .context-bar .context-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -125,6 +130,12 @@ body{font-family:'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;background:
     <div class="login-error" id="loginError"></div>
     <button type="submit" id="loginBtn">Sign in</button>
   </form>
+</div>
+
+<div class="history-bar" id="historyBar">
+  <span>Recent chats</span>
+  <select id="historySelect" title="Your chats from the last few days" onchange="openConversation(this.value)"></select>
+  <button onclick="newChat()" title="Start a new conversation">+ New chat</button>
 </div>
 
 <div class="context-bar" id="contextBar">
@@ -184,6 +195,14 @@ const suggestionsEl = document.getElementById('suggestions');
 let conversationHistory = [];
 let agents = [];
 let currentAgent = null;
+let historyDays = 0;
+let conversationId = null;
+let dashboardName = null;
+
+function newId() {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  return 'id-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+}
 
 // ---------------------------------------------------------------------------
 // Snowflake sign-in. Each viewer uses their own Snowflake user, so Snowflake
@@ -219,6 +238,7 @@ function showSignedIn(user, role) {
 function showLogin(message) {
   saveToken(null);
   document.getElementById('userChip').style.display = 'none';
+  document.getElementById('historyBar').style.display = 'none';
   const err = document.getElementById('loginError');
   err.textContent = message || '';
   err.style.display = message ? 'block' : 'none';
@@ -254,7 +274,8 @@ async function signIn(event) {
     }
     const s = await resp.json();
     saveToken(s.token);
-    // A different user must not continue someone else's conversation.
+    // A different user must not continue someone else's conversation; this also
+    // loads the signed-in user's saved chats.
     if (currentAgent) selectAgent(currentAgent);
     showSignedIn(s.user, s.role);
   } catch (e) {
@@ -266,6 +287,7 @@ async function signIn(event) {
 
 async function signOut() {
   try { await authFetch('/api/logout', {method: 'POST'}); } catch (e) {}
+  saveToken(null);
   if (currentAgent) selectAgent(currentAgent);
   showLogin();
 }
@@ -326,8 +348,111 @@ function selectAgent(id) {
   document.getElementById('agentTitle').textContent = (agent ? agent.label : id) + ' Agent';
   document.title = (agent ? agent.label : id) + ' Agent';
   conversationHistory = [];
+  conversationId = newId();
   chatEl.innerHTML = '';
   renderSuggestions();
+  if (historyEnabled()) loadConversations(true);
+  else document.getElementById('historyBar').style.display = 'none';
+}
+
+// ---------------------------------------------------------------------------
+// Saved chat history (shown when the backend has CHAT_HISTORY_DAYS > 0).
+// History belongs to the signed-in Snowflake user; the backend works out who
+// that is from the session, so nothing here identifies the user.
+// ---------------------------------------------------------------------------
+function historyEnabled() { return historyDays > 0 && !!authToken; }
+
+function historyUrl(path, params) {
+  return '/api/history/' + path + '?' + new URLSearchParams(Object.assign({agent: currentAgent}, params || {}));
+}
+
+function conversationLabel(c) {
+  const when = new Date(c.last_at).toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'});
+  const title = c.title.length > 60 ? c.title.substring(0, 60) + '…' : c.title;
+  return when + ' — ' + title;
+}
+
+function resetHistorySelect() {
+  const select = document.getElementById('historySelect');
+  select.innerHTML = '';
+  const opt = document.createElement('option');
+  opt.value = '';
+  opt.textContent = 'New conversation';
+  select.appendChild(opt);
+  return select;
+}
+
+// Lists the signed-in user's recent chats; with openLatest, reopens the most recent one
+// (unless the user has already started asking in the meantime).
+async function loadConversations(openLatest) {
+  const agentAtStart = currentAgent;
+  document.getElementById('historyBar').style.display = 'flex';
+  const select = resetHistorySelect();
+  try {
+    const resp = await authFetch(historyUrl('conversations'));
+    if (!resp.ok || currentAgent !== agentAtStart) return;
+    const list = (await resp.json()).conversations;
+    list.forEach(function(c) {
+      const opt = document.createElement('option');
+      opt.value = c.conversation_id;
+      opt.textContent = conversationLabel(c);
+      select.appendChild(opt);
+    });
+    if (openLatest && list.length && !conversationHistory.length) {
+      select.value = list[0].conversation_id;
+      await openConversation(list[0].conversation_id);
+    }
+  } catch (e) {
+    console.warn('Loading chat history failed', e);
+  }
+}
+
+async function openConversation(id) {
+  if (!id) { newChat(); return; }
+  try {
+    const resp = await authFetch(historyUrl('messages', {conversation_id: id}));
+    if (!resp.ok) return;
+    const msgs = (await resp.json()).messages;
+    conversationId = id;
+    conversationHistory = [];
+    chatEl.innerHTML = '';
+    suggestionsEl.style.display = 'none';
+    msgs.forEach(function(m) {
+      addMessage('user', escapeHtml(m.question));
+      renderAnswer(m);
+      conversationHistory.push(
+        {role: 'user', content: [{type: 'text', text: m.question}]},
+        {role: 'assistant', content: [{type: 'text', text: m.answer}]}
+      );
+    });
+    if (msgs.length) renderFollowups(msgs[msgs.length - 1].suggestions);
+  } catch (e) {
+    console.warn('Opening conversation failed', e);
+  }
+}
+
+function newChat() {
+  conversationHistory = [];
+  conversationId = newId();
+  chatEl.innerHTML = '';
+  renderSuggestions();
+  document.getElementById('historySelect').value = '';
+}
+
+// After a question is answered, make sure the current chat is in the list.
+function rememberConversation(question) {
+  if (!historyEnabled()) return;
+  const select = document.getElementById('historySelect');
+  const existing = Array.prototype.find.call(select.options, function(o) { return o.value === conversationId; });
+  const opt = existing || document.createElement('option');
+  opt.value = conversationId;
+  if (!existing) opt.textContent = conversationLabel({last_at: new Date().toISOString(), title: question});
+  select.insertBefore(opt, select.options[1] || null);
+  select.value = conversationId;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 // ?agent=PHARMA picks the agent (and hides the dropdown), e.g. for a Tableau Web Page object.
@@ -335,6 +460,7 @@ async function loadAgents() {
   const resp = await fetch(window.location.origin + '/api/agents');
   const cfg = await resp.json();
   agents = cfg.agents;
+  historyDays = cfg.history_days || 0;
   const select = document.getElementById('agentSelect');
   agents.forEach(function(a) {
     const opt = document.createElement('option');
@@ -406,6 +532,7 @@ async function initTableauExtension() {
   });
   await tableau.extensions.initializeAsync();
   const dashboard = tableau.extensions.dashboardContent.dashboard;
+  dashboardName = dashboard.name;
   (await dashboard.getParametersAsync()).forEach(function(p) {
     recordParameter(p);
     p.addEventListener(tableau.TableauEventType.ParameterChanged, async function(e) {
@@ -487,7 +614,11 @@ async function sendMessage() {
     const resp = await authFetch('/api/chat', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({question: withContext(question), conversation_history: conversationHistory, agent: currentAgent}),
+      body: JSON.stringify({
+        question: withContext(question), conversation_history: conversationHistory, agent: currentAgent,
+        display_question: question, conversation_id: historyEnabled() ? conversationId : null,
+        dashboard: dashboardName,
+      }),
     });
 
     removeTyping();
@@ -508,50 +639,13 @@ async function sendMessage() {
     }
 
     const data = await resp.json();
-    let html = mdToHtml(data.answer);
-
-    if (data.chart_spec) {
-      html += '<div class="chart-container" id="chart-' + Date.now() + '"></div>';
-    }
-
-    if (data.sql) {
-      html += renderSqlBlock(data.sql);
-    }
-
-    if (data.data && data.data.length > 0) {
-      html += renderTable(data.data);
-    }
-
-    const msgDiv = addMessage('assistant', html);
-
-    if (data.chart_spec) {
-      try {
-        var chartDiv = msgDiv.querySelector('.chart-container');
-        if (chartDiv && typeof vegaEmbed !== 'undefined') {
-          var spec = (typeof data.chart_spec === 'string') ? JSON.parse(data.chart_spec) : data.chart_spec;
-          console.log('Chart spec:', JSON.stringify(spec).substring(0, 500));
-          var chartWidth = Math.max(chartDiv.offsetWidth - 40, 400);
-          spec.width = chartWidth;
-          spec.height = 320;
-          spec.autosize = {type: 'fit', contains: 'padding'};
-          vegaEmbed(chartDiv, spec, {actions: false, renderer: 'svg'}).then(function(result) {
-            console.log('Chart rendered successfully');
-          }).catch(function(e) {
-            console.warn('Chart render failed', e);
-            chartDiv.innerHTML = '<p style="color:#dc2626;font-size:12px">Chart error: ' + e.message + '</p>';
-          });
-        }
-      } catch (e) {
-        console.warn('Chart parse failed', e);
-        var cd = msgDiv.querySelector('.chart-container');
-        if (cd) cd.innerHTML = '<p style="color:#dc2626;font-size:12px">Chart parse error: ' + e.message + '</p>';
-      }
-    }
+    renderAnswer(data);
 
     conversationHistory.push(
       {role: 'user', content: [{type: 'text', text: question}]},
       {role: 'assistant', content: [{type: 'text', text: data.answer}]}
     );
+    rememberConversation(question);
     renderFollowups(data.suggestions);
 
   } catch (err) {
@@ -561,6 +655,49 @@ async function sendMessage() {
 
   sendBtn.disabled = false;
   inputEl.focus();
+}
+
+// Renders one assistant answer (text, chart, SQL, table): used for new and restored answers.
+function renderAnswer(data) {
+  let html = mdToHtml(data.answer);
+
+  if (data.chart_spec) {
+    html += '<div class="chart-container" id="chart-' + Date.now() + '"></div>';
+  }
+
+  if (data.sql) {
+    html += renderSqlBlock(data.sql);
+  }
+
+  if (data.data && data.data.length > 0) {
+    html += renderTable(data.data);
+  }
+
+  const msgDiv = addMessage('assistant', html);
+
+  if (data.chart_spec) {
+    try {
+      var chartDiv = msgDiv.querySelector('.chart-container');
+      if (chartDiv && typeof vegaEmbed !== 'undefined') {
+        var spec = (typeof data.chart_spec === 'string') ? JSON.parse(data.chart_spec) : data.chart_spec;
+        console.log('Chart spec:', JSON.stringify(spec).substring(0, 500));
+        var chartWidth = Math.max(chartDiv.offsetWidth - 40, 400);
+        spec.width = chartWidth;
+        spec.height = 320;
+        spec.autosize = {type: 'fit', contains: 'padding'};
+        vegaEmbed(chartDiv, spec, {actions: false, renderer: 'svg'}).then(function(result) {
+          console.log('Chart rendered successfully');
+        }).catch(function(e) {
+          console.warn('Chart render failed', e);
+          chartDiv.innerHTML = '<p style="color:#dc2626;font-size:12px">Chart error: ' + e.message + '</p>';
+        });
+      }
+    } catch (e) {
+      console.warn('Chart parse failed', e);
+      var cd = msgDiv.querySelector('.chart-container');
+      if (cd) cd.innerHTML = '<p style="color:#dc2626;font-size:12px">Chart parse error: ' + e.message + '</p>';
+    }
+  }
 }
 
 function askQuestion(q) {
