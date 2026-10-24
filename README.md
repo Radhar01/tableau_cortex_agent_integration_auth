@@ -190,13 +190,31 @@ GRANT SERVICE ROLE TABLEAU_DEMO.TABLEAU_AGENT_DEMO.CORTEX_AGENT_SERVICE!ALL_ENDP
 - "How many orders are still pending?"
 - "What is the average discount by customer segment?"
 
-## How SPCS Auth Works
+## How Auth Works (per-user, for row-level security)
 
-When deployed to SPCS, the app auto-detects its environment:
-- **SPCS**: Reads an OAuth token from `/snowflake/session/token` (auto-provided by Snowflake). Uses `SNOWFLAKE_HOST` and `SNOWFLAKE_ACCOUNT` env vars (auto-set by SPCS).
-- **Local**: Uses `SNOWFLAKE_USER` / `SNOWFLAKE_PASSWORD` from `.env` to obtain a session token via the Snowflake connector.
+The chat does not use a shared Snowflake login. When the page opens, including as a
+Tableau dashboard extension, it asks for the viewer's **own Snowflake username and
+password** (plus an optional role and MFA passcode):
 
-No code changes are needed between the two modes.
+1. `POST /api/login` opens a Snowflake connection as that user and returns a random
+   session token. The password is used only for that sign-in and is never stored.
+2. The browser keeps the token for the tab (`sessionStorage`) and sends it as
+   `Authorization: Bearer <token>` on every `/api/chat` call.
+3. The backend calls the Cortex Agent (or Cortex Analyst plus the generated SQL) with
+   **that user's** Snowflake session. Snowflake row access policies, masking policies
+   and grants therefore apply to the signed-in user, in the same way Tableau RLS does.
+4. Sessions end after `SESSION_IDLE_MINUTES` of inactivity, or when the user clicks
+   **Sign out**. The UI then shows the sign-in again.
+
+If no role is entered, the user's default role is used. Each user needs `USAGE` on
+the agent, the semantic view, the database/schema and the warehouse.
+
+`SNOWFLAKE_ACCOUNT` (and `SNOWFLAKE_HOST`, when set) select the account. Serve the app
+over **HTTPS** in any shared deployment, because passwords are sent to `/api/login`.
+
+> **SPCS note:** password sign-in from inside SPCS needs network egress to the account
+> host. Without it, use caller's rights (the `Sf-Context-Current-User-Token` header)
+> instead.
 
 ## Customization
 

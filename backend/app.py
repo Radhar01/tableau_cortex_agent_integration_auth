@@ -1,7 +1,10 @@
 import os
 import json
+import time
+import secrets
 import logging
 import datetime
+import threading
 from decimal import Decimal
 from pathlib import Path
 from typing import Optional
@@ -9,7 +12,7 @@ from typing import Optional
 import requests
 import snowflake.connector
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -35,10 +38,9 @@ app.add_middleware(
 
 SNOWFLAKE_ACCOUNT = os.getenv("SNOWFLAKE_ACCOUNT")
 SNOWFLAKE_HOST = os.getenv("SNOWFLAKE_HOST")
-SNOWFLAKE_USER = os.getenv("SNOWFLAKE_USER")
-SNOWFLAKE_PASSWORD = os.getenv("SNOWFLAKE_PASSWORD")
-SNOWFLAKE_ROLE = os.getenv("SNOWFLAKE_ROLE", "SYSADMIN")
 SNOWFLAKE_WAREHOUSE = os.getenv("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH")
+# Signed-in users who make no request for this long are signed out.
+SESSION_IDLE_MINUTES = int(os.getenv("SESSION_IDLE_MINUTES", "60"))
 # Trial accounts cannot call Cortex Agents; this mode calls Cortex Analyst
 # with the semantic view directly and runs the generated SQL instead.
 USE_CORTEX_ANALYST = os.getenv("USE_CORTEX_ANALYST", "false").lower() == "true"
@@ -103,39 +105,81 @@ def _is_running_in_spcs() -> bool:
     return os.path.exists(SPCS_TOKEN_PATH)
 
 
-def _get_spcs_login_token() -> str:
-    with open(SPCS_TOKEN_PATH, "r") as f:
-        return f.read()
-
-
-def _open_session(profile: dict):
-    """Return (connection, REST host, log tag) for SPCS or local mode."""
-    if _is_running_in_spcs():
-        conn = snowflake.connector.connect(
-            host=SNOWFLAKE_HOST,
-            account=SNOWFLAKE_ACCOUNT,
-            token=_get_spcs_login_token(),
-            authenticator="oauth",
-            warehouse=profile["warehouse"],
-            database=profile["database"],
-            schema=profile["schema"],
-        )
-        return conn, SNOWFLAKE_HOST, "SPCS"
-    conn = snowflake.connector.connect(
-        account=SNOWFLAKE_ACCOUNT,
-        user=SNOWFLAKE_USER,
-        password=SNOWFLAKE_PASSWORD,
-        role=SNOWFLAKE_ROLE,
-        warehouse=profile["warehouse"],
-        database=profile["database"],
-        schema=profile["schema"],
-        session_parameters={"PYTHON_CONNECTOR_QUERY_RESULT_FORMAT": "json"},
-    )
+def _rest_host() -> str:
+    if SNOWFLAKE_HOST:
+        return SNOWFLAKE_HOST
     account_parts = SNOWFLAKE_ACCOUNT.replace("_", "-").split(".")
-    return conn, f"{account_parts[0]}.snowflakecomputing.com", "Local"
+    return f"{account_parts[0]}.snowflakecomputing.com"
+
+
+# ---------------------------------------------------------------------------
+# Per-user sessions. Each viewer signs in with their own Snowflake credentials,
+# so the agent and any SQL run as that user and role, and Snowflake row access
+# policies apply the same way Tableau RLS does. Only the open connection is
+# kept, never the password.
+# ---------------------------------------------------------------------------
+_sessions: dict = {}
+_sessions_lock = threading.Lock()
+
+
+def _close_quietly(conn):
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _purge_idle_sessions():
+    cutoff = time.time() - SESSION_IDLE_MINUTES * 60
+    with _sessions_lock:
+        expired = [t for t, sess in _sessions.items() if sess["last_used"] < cutoff]
+        conns = [_sessions.pop(t)["conn"] for t in expired]
+    for conn in conns:
+        _close_quietly(conn)
+
+
+def _bearer(authorization: Optional[str]) -> str:
+    return (authorization or "").removeprefix("Bearer ").strip()
+
+
+def _drop_session(token: str):
+    with _sessions_lock:
+        sess = _sessions.pop(token, None)
+    if sess:
+        _close_quietly(sess["conn"])
+
+
+def _session(authorization: Optional[str]) -> dict:
+    """Return the signed-in session for an "Authorization: Bearer <token>" header, or raise 401."""
+    _purge_idle_sessions()
+    token = _bearer(authorization)
+    with _sessions_lock:
+        sess = _sessions.get(token)
+    if not sess:
+        raise HTTPException(status_code=401, detail="Not signed in or session expired. Please sign in to Snowflake.")
+    if sess["conn"].is_closed():
+        _drop_session(token)
+        raise HTTPException(status_code=401, detail="Snowflake session ended. Please sign in again.")
+    sess["last_used"] = time.time()
+    return sess
+
+
+def _use_profile(sess: dict, profile: dict):
+    """Point the user's Snowflake session at the profile's warehouse, database and schema."""
+    if sess["profile_id"] == profile["id"]:
+        return
+    cur = sess["conn"].cursor()
+    try:
+        cur.execute(f'USE WAREHOUSE "{profile["warehouse"]}"')
+        cur.execute(f'USE SCHEMA "{profile["database"]}"."{profile["schema"]}"')
+    finally:
+        cur.close()
+    sess["profile_id"] = profile["id"]
 
 
 def _post(conn, url: str, payload: dict, tag: str) -> dict:
+    if not conn.rest or not conn.rest.token:
+        raise HTTPException(status_code=401, detail="Snowflake session ended. Please sign in again.")
     headers = {
         "Authorization": f'Snowflake Token="{conn.rest.token}"',
         "Content-Type": "application/json",
@@ -146,20 +190,19 @@ def _post(conn, url: str, payload: dict, tag: str) -> dict:
     logger.info(f"[{tag}] Response status: {resp.status_code}")
     if resp.status_code != 200:
         logger.error(f"[{tag}] Error: {resp.text[:1000]}")
+        if resp.status_code == 401:
+            raise HTTPException(status_code=401, detail="Snowflake session expired. Please sign in again.")
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return resp.json()
 
 
-def _call_agent(messages: list, profile: dict) -> dict:
-    conn, host, tag = _open_session(profile)
+def _call_agent(messages: list, profile: dict, sess: dict) -> dict:
+    _use_profile(sess, profile)
     url = (
-        f"https://{host}/api/v2/databases/{profile['database']}"
+        f"https://{_rest_host()}/api/v2/databases/{profile['database']}"
         f"/schemas/{profile['schema']}/agents/{profile['agent_name']}:run"
     )
-    try:
-        return _post(conn, url, {"messages": messages, "stream": False}, tag)
-    finally:
-        conn.close()
+    return _post(sess["conn"], url, {"messages": messages, "stream": False}, sess["user"])
 
 
 def _json_safe(value):
@@ -170,7 +213,7 @@ def _json_safe(value):
     return value
 
 
-def _chat_via_analyst(messages: list, profile: dict) -> "ChatResponse":
+def _chat_via_analyst(messages: list, profile: dict, sess: dict) -> "ChatResponse":
     if not profile["semantic_view"]:
         raise HTTPException(status_code=400, detail=f"{profile['id']}_SEMANTIC_VIEW is required for Cortex Analyst mode")
     # Cortex Analyst expects the assistant role to be named "analyst".
@@ -178,33 +221,34 @@ def _chat_via_analyst(messages: list, profile: dict) -> "ChatResponse":
         {**m, "role": "analyst" if m.get("role") == "assistant" else m.get("role")}
         for m in messages
     ]
-    conn, host, tag = _open_session(profile)
-    try:
-        body = _post(
-            conn,
-            f"https://{host}/api/v2/cortex/analyst/message",
-            {"messages": analyst_messages, "semantic_view": profile["semantic_view"]},
-            tag,
-        )
-        answer_parts = []
-        sql_text = None
-        data_rows = None
-        suggestions = []
-        for item in body.get("message", {}).get("content", []):
-            item_type = item.get("type")
-            if item_type == "text":
-                answer_parts.append(item.get("text", ""))
-            elif item_type == "sql":
-                sql_text = item.get("statement")
-            elif item_type == "suggestions":
-                suggestions.extend(item.get("suggestions", []))
-        if sql_text:
-            cur = conn.cursor(snowflake.connector.DictCursor)
+    _use_profile(sess, profile)
+    conn = sess["conn"]
+    body = _post(
+        conn,
+        f"https://{_rest_host()}/api/v2/cortex/analyst/message",
+        {"messages": analyst_messages, "semantic_view": profile["semantic_view"]},
+        sess["user"],
+    )
+    answer_parts = []
+    sql_text = None
+    data_rows = None
+    suggestions = []
+    for item in body.get("message", {}).get("content", []):
+        item_type = item.get("type")
+        if item_type == "text":
+            answer_parts.append(item.get("text", ""))
+        elif item_type == "sql":
+            sql_text = item.get("statement")
+        elif item_type == "suggestions":
+            suggestions.extend(item.get("suggestions", []))
+    if sql_text:
+        cur = conn.cursor(snowflake.connector.DictCursor)
+        try:
             rows = cur.execute(sql_text).fetchall()
-            data_rows = [{k: _json_safe(v) for k, v in row.items()} for row in rows]
-            answer_parts.append(f"Returned {len(data_rows)} row(s).")
-    finally:
-        conn.close()
+        finally:
+            cur.close()
+        data_rows = [{k: _json_safe(v) for k, v in row.items()} for row in rows]
+        answer_parts.append(f"Returned {len(data_rows)} row(s).")
 
     return ChatResponse(
         answer="\n\n".join(answer_parts) or "Cortex Analyst returned no answer.",
@@ -220,6 +264,13 @@ class ChatRequest(BaseModel):
     agent: Optional[str] = None
 
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+    role: Optional[str] = None
+    passcode: Optional[str] = None
+
+
 class ChatResponse(BaseModel):
     answer: str
     sql: Optional[str] = None
@@ -228,8 +279,59 @@ class ChatResponse(BaseModel):
     suggestions: Optional[list] = None
 
 
+@app.post("/api/login")
+def login(req: LoginRequest):
+    username = req.username.strip()
+    if not username or not req.password:
+        raise HTTPException(status_code=400, detail="Username and password are required.")
+    params = {
+        "account": SNOWFLAKE_ACCOUNT,
+        "user": username,
+        "password": req.password,
+        "client_session_keep_alive": True,
+        "login_timeout": 30,
+        "session_parameters": {"PYTHON_CONNECTOR_QUERY_RESULT_FORMAT": "json"},
+    }
+    if SNOWFLAKE_HOST:
+        params["host"] = SNOWFLAKE_HOST
+    # Without a role the user's default role applies, so their Snowflake grants decide what they see.
+    if req.role and req.role.strip():
+        params["role"] = req.role.strip()
+    if req.passcode and req.passcode.strip():
+        params["passcode"] = req.passcode.strip()
+    try:
+        conn = snowflake.connector.connect(**params)
+    except snowflake.connector.errors.Error as e:
+        logger.warning(f"Sign-in failed for {username}: {e.msg}")
+        raise HTTPException(status_code=401, detail=e.msg or "Snowflake sign-in failed.")
+
+    cur = conn.cursor()
+    try:
+        user, role = cur.execute("SELECT CURRENT_USER(), CURRENT_ROLE()").fetchone()
+    finally:
+        cur.close()
+    token = secrets.token_urlsafe(32)
+    with _sessions_lock:
+        _sessions[token] = {"conn": conn, "user": user, "role": role, "profile_id": None, "last_used": time.time()}
+    logger.info(f"Signed in {user} (role {role})")
+    return {"token": token, "user": user, "role": role}
+
+
+@app.post("/api/logout")
+def logout(authorization: Optional[str] = Header(None)):
+    _drop_session(_bearer(authorization))
+    return {"status": "signed_out"}
+
+
+@app.get("/api/me")
+def me(authorization: Optional[str] = Header(None)):
+    sess = _session(authorization)
+    return {"user": sess["user"], "role": sess["role"]}
+
+
 @app.post("/api/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
+def chat(req: ChatRequest, authorization: Optional[str] = Header(None)):
+    sess = _session(authorization)
     messages = []
     if req.conversation_history:
         messages.extend(req.conversation_history)
@@ -241,7 +343,7 @@ def chat(req: ChatRequest):
 
     if USE_CORTEX_ANALYST:
         try:
-            return _chat_via_analyst(messages, profile)
+            return _chat_via_analyst(messages, profile, sess)
         except HTTPException:
             raise
         except Exception as e:
@@ -249,7 +351,7 @@ def chat(req: ChatRequest):
             raise HTTPException(status_code=500, detail=str(e))
 
     try:
-        body = _call_agent(messages, profile)
+        body = _call_agent(messages, profile, sess)
     except HTTPException:
         raise
     except Exception as e:
@@ -327,6 +429,7 @@ def health():
         "default_agent": DEFAULT_AGENT,
         "mode": "cortex_analyst" if USE_CORTEX_ANALYST else "cortex_agent",
         "running_in_spcs": _is_running_in_spcs(),
+        "signed_in_sessions": len(_sessions),
     }
 
 
@@ -339,10 +442,11 @@ def agents():
 
 
 @app.post("/api/debug")
-def debug(req: ChatRequest):
+def debug(req: ChatRequest, authorization: Optional[str] = Header(None)):
+    sess = _session(authorization)
     messages = [{"role": "user", "content": [{"type": "text", "text": req.question}]}]
     try:
-        body = _call_agent(messages, _profile(req.agent))
+        body = _call_agent(messages, _profile(req.agent), sess)
         return {"status_code": 200, "body": body}
     except HTTPException as e:
         return {"status_code": e.status_code, "body": e.detail}

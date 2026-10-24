@@ -81,6 +81,23 @@ body{font-family:'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;background:
 .followups button{text-align:left;padding:8px 14px;background:#e8eef6;color:#002855;border:1px solid #c4d2e4;border-radius:14px;font-size:12px;font-weight:500;line-height:1.4;cursor:pointer;transition:all .2s}
 .followups button:hover{background:#002855;color:#fff;border-color:#002855}
 
+.user-chip{display:none;align-items:center;gap:8px;font-size:11px;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.2);padding:3px 4px 3px 10px;border-radius:12px}
+.user-chip button{background:rgba(255,255,255,.18);color:#fff;border:none;border-radius:9px;padding:3px 8px;font-size:11px;cursor:pointer}
+.user-chip button:hover{background:rgba(255,255,255,.3)}
+
+.login-overlay{position:fixed;inset:0;background:rgba(0,20,45,.55);display:none;align-items:center;justify-content:center;z-index:100;padding:16px}
+.login-overlay.show{display:flex}
+.login-card{background:#fff;border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,.25);padding:24px;width:100%;max-width:360px;display:flex;flex-direction:column;gap:12px}
+.login-card h2{font-size:16px;color:#002855}
+.login-card p{font-size:12px;color:#5a6a7a;line-height:1.5}
+.login-card label{display:flex;flex-direction:column;gap:4px;font-size:12px;font-weight:600;color:#2c3e50}
+.login-card label span{font-weight:400;color:#7a8a9a}
+.login-card input{padding:9px 12px;border:1px solid #c8d0da;border-radius:8px;font-size:14px;outline:none}
+.login-card input:focus{border-color:#002855;box-shadow:0 0 0 3px rgba(0,40,85,.12)}
+.login-card button{padding:10px;background:#002855;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer}
+.login-card button:disabled{background:#94a3b8;cursor:not-allowed}
+.login-card .login-error{display:none;color:#dc2626;font-size:12px}
+
 @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
 @keyframes bounce{to{transform:translateY(-6px)}}
 </style>
@@ -94,6 +111,20 @@ body{font-family:'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;background:
   </div>
   <select id="agentSelect" title="Choose which agent answers" onchange="selectAgent(this.value)" style="display:none"></select>
   <span class="badge" id="agentBadge">AI Assistant</span>
+  <span class="user-chip" id="userChip"><span id="userName"></span><button onclick="signOut()">Sign out</button></span>
+</div>
+
+<div class="login-overlay" id="loginOverlay">
+  <form class="login-card" id="loginForm" onsubmit="signIn(event)">
+    <h2>Sign in to Snowflake</h2>
+    <p>Use your own Snowflake account. The agent answers with the data your Snowflake user and role can see.</p>
+    <label>Username<input id="loginUser" autocomplete="username" required></label>
+    <label>Password<input id="loginPassword" type="password" autocomplete="current-password" required></label>
+    <label>Role <span>(optional, uses your default role if blank)</span><input id="loginRole"></label>
+    <label>MFA passcode <span>(optional)</span><input id="loginPasscode" inputmode="numeric" autocomplete="one-time-code"></label>
+    <div class="login-error" id="loginError"></div>
+    <button type="submit" id="loginBtn">Sign in</button>
+  </form>
 </div>
 
 <div class="context-bar" id="contextBar">
@@ -146,7 +177,6 @@ function mdToHtml(md) {
   return result.join('\n');
 }
 
-const API_URL = window.location.origin + '/api/chat';
 const chatEl = document.getElementById('chat');
 const inputEl = document.getElementById('userInput');
 const sendBtn = document.getElementById('sendBtn');
@@ -154,6 +184,103 @@ const suggestionsEl = document.getElementById('suggestions');
 let conversationHistory = [];
 let agents = [];
 let currentAgent = null;
+
+// ---------------------------------------------------------------------------
+// Snowflake sign-in. Each viewer uses their own Snowflake user, so Snowflake
+// row access policies apply to their questions. The backend hands back a
+// session token, kept for this browser tab only and sent as a Bearer header
+// (cookies are often blocked inside Tableau's extension iframe).
+// ---------------------------------------------------------------------------
+const TOKEN_KEY = 'snowflakeSession';
+let authToken = null;
+try { authToken = sessionStorage.getItem(TOKEN_KEY); } catch (e) {}
+
+function saveToken(token) {
+  authToken = token;
+  try {
+    if (token) sessionStorage.setItem(TOKEN_KEY, token);
+    else sessionStorage.removeItem(TOKEN_KEY);
+  } catch (e) {}
+}
+
+function authFetch(path, options) {
+  options = options || {};
+  options.headers = Object.assign({}, options.headers, authToken ? {'Authorization': 'Bearer ' + authToken} : {});
+  return fetch(window.location.origin + path, options);
+}
+
+function showSignedIn(user, role) {
+  document.getElementById('userName').textContent = user + (role ? ' · ' + role : '');
+  document.getElementById('userChip').style.display = 'flex';
+  document.getElementById('loginOverlay').classList.remove('show');
+  inputEl.focus();
+}
+
+function showLogin(message) {
+  saveToken(null);
+  document.getElementById('userChip').style.display = 'none';
+  const err = document.getElementById('loginError');
+  err.textContent = message || '';
+  err.style.display = message ? 'block' : 'none';
+  document.getElementById('loginPassword').value = '';
+  document.getElementById('loginPasscode').value = '';
+  document.getElementById('loginOverlay').classList.add('show');
+  document.getElementById(document.getElementById('loginUser').value ? 'loginPassword' : 'loginUser').focus();
+}
+
+async function errorDetail(resp) {
+  const text = await resp.text();
+  try { return JSON.parse(text).detail || text; } catch (e) { return text; }
+}
+
+async function signIn(event) {
+  event.preventDefault();
+  const btn = document.getElementById('loginBtn');
+  btn.disabled = true;
+  try {
+    const resp = await fetch(window.location.origin + '/api/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        username: document.getElementById('loginUser').value,
+        password: document.getElementById('loginPassword').value,
+        role: document.getElementById('loginRole').value || null,
+        passcode: document.getElementById('loginPasscode').value || null,
+      }),
+    });
+    if (!resp.ok) {
+      showLogin(await errorDetail(resp));
+      return;
+    }
+    const s = await resp.json();
+    saveToken(s.token);
+    // A different user must not continue someone else's conversation.
+    if (currentAgent) selectAgent(currentAgent);
+    showSignedIn(s.user, s.role);
+  } catch (e) {
+    showLogin('Could not reach the server: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function signOut() {
+  try { await authFetch('/api/logout', {method: 'POST'}); } catch (e) {}
+  if (currentAgent) selectAgent(currentAgent);
+  showLogin();
+}
+
+async function checkSession() {
+  if (!authToken) { showLogin(); return; }
+  try {
+    const resp = await authFetch('/api/me');
+    if (!resp.ok) { showLogin(); return; }
+    const s = await resp.json();
+    showSignedIn(s.user, s.role);
+  } catch (e) {
+    showLogin('Could not reach the server: ' + e.message);
+  }
+}
 
 function renderSuggestions() {
   suggestionsEl.innerHTML = '';
@@ -224,7 +351,7 @@ async function loadAgents() {
   select.value = pinned ? fromUrl : cfg.default;
   selectAgent(select.value);
 }
-loadAgents();
+loadAgents().catch(function(e) { console.warn('Loading agents failed', e); }).then(checkSession);
 
 // ---------------------------------------------------------------------------
 // Tableau dashboard extension mode (?mode=extension, set by the .trex manifest).
@@ -357,13 +484,21 @@ async function sendMessage() {
   showTyping();
 
   try {
-    const resp = await fetch(API_URL, {
+    const resp = await authFetch('/api/chat', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({question: withContext(question), conversation_history: conversationHistory, agent: currentAgent}),
     });
 
     removeTyping();
+
+    if (resp.status === 401) {
+      addMessage('assistant', '<span style="color:#dc2626">Your Snowflake session has ended. Sign in again, then ask your question again.</span>');
+      inputEl.value = question;
+      sendBtn.disabled = false;
+      showLogin(await errorDetail(resp));
+      return;
+    }
 
     if (!resp.ok) {
       const errText = await resp.text();
